@@ -1,18 +1,18 @@
 /*
- * hp_prime_stream_win.c - The Ultimate High Performance Zen 4 Prime Generator
- * 
- * Target: AMD Ryzen 7 7840HS (Zen 4, 8C/16T) - Uses 14 workers + 1 writer
- * Author: RamnathAK - Optimized for Windows x64
- * 
+ * hp_prime_stream_win.c - High-Performance Lock-Free Zen 4 Prime Stream Generator
+ *
+ * Target: AMD Ryzen 7 7840HS (Zen 4, 8C/16T single-CCD) - 14 workers + 1 writer
+ * Author: RamnathAK - Optimized for Windows x64 (MSVC / clang-cl)
+ *
  * ------------------------------------------------------------------
- * HIGH-LEVEL OVERVIEW:
- * 1. Lock-free ring buffer (64 slots) connects 14 workers -> 1 writer
- * 2. Each worker gets a ticket (block index) via atomic increment
- * 3. Block = 30720 numbers = 8192 wheel-30 candidates (filters multiples of 2,3,5)
- * 4. Primality: Trial division by primes <=163 + deterministic Miller-Rabin for 64-bit
- * 5. Montgomery multiplication avoids expensive DIV instructions
- * 6. fast_utoa_nl formats primes using 2-digit LUT (no sprintf)
- * 7. Writer streams blocks in order to 100MB chunked files, supports resume from last generated prime
+ * ARCHITECTURE OVERVIEW:
+ * 1. Lock-free ring buffer (64 slots x 64 KiB) connects 14 workers -> 1 writer
+ * 2. Each worker acquires a ticket (block index) via cache-isolated atomic increment
+ * 3. Block = 30,720 integers = 8,192 mod-30 wheel candidates (skips multiples of 2,3,5)
+ * 4. Primality: Trial division (primes 7..163) + deterministic 64-bit Miller-Rabin
+ * 5. Montgomery multiplication (R = 2^64) replaces division with MULX/MULH
+ * 6. fast_utoa_nl formats primes using a 2-digit LUT (zero sprintf/CRT overhead)
+ * 7. Writer streams tickets sequentially to 100 MiB chunked files with auto-resume
  * ------------------------------------------------------------------
  */
 
@@ -29,15 +29,15 @@
 #endif
 
 // ------------------------------------------------------------------
-// PLATFORM ABSTRACTION: 128-bit math
-// Zen4 has fast MULX/ADOX. MSVC provides _umulh/_umul128. clang-cl doesn't,
-// so we inline raw MULQ/DIVQ to avoid compiler-rt __umodti3 calls.
+// PLATFORM ABSTRACTION: 128-bit unsigned arithmetic
+// Zen 4 executes MULX/MULQ at 2/cycle. MSVC provides _umulh/_umul128.
+// For clang-cl on Windows, inline raw MULQ/DIVQ to avoid compiler-rt calls.
 // ------------------------------------------------------------------
 #if defined(__clang__) && defined(_WIN64)
 static inline uint64_t my_umulh(uint64_t a, uint64_t b) {
     uint64_t low, high;
     __asm__("mulq %3" : "=a"(low), "=d"(high) : "%a"(a), "r"(b));
-    return high; // Returns high 64 bits of 128-bit product
+    return high;
 }
 static inline uint64_t my_udiv128_rem(uint64_t high, uint64_t low, uint64_t divisor) {
     uint64_t q, rem;
@@ -62,39 +62,43 @@ static inline uint64_t my_udiv128_rem(uint64_t high, uint64_t low, uint64_t divi
 
 #pragma comment(lib, "synchronization.lib")
 
-// --- Configuration ---
-// NUM_WORKERS = 14 : Ryzen 7 7840HS has 8 cores / 16 threads. We leave 1 core (2 threads) free
-// for writer + OS. Using 7 physical cores avoids cross-CCD latency (7840HS is single CCD).
+// --- Pipeline & Topology Configuration ---
+// Ryzen 7 7840HS has 8 physical cores / 16 logical processors (SMT) on a single CCD.
+// Logical processors 0..13 (Physical Cores 0..6) run worker threads.
+// Logical processor 14 (Physical Core 7, Thread 0) runs the sequential I/O writer.
+// Logical processor 15 (Physical Core 7, Thread 1) is left free for OS interrupts.
 #define NUM_WORKERS 14
-#define RING_SIZE 64                     // Power of 2 for fast & masking, > NUM_WORKERS to hide latency
-#define CANDIDATES_PER_BLOCK 8192        // 1024 * 8 wheel steps -> keeps L1i hot
-#define BLOCK_SIZE 30720                 // 1024 * 30 (exact mod-30 multiple) -> ensures wheel alignment across tickets
-#define BLOCK_TEXT_CAP 65520             // 64 KiB minus 16-byte header -> fits exactly in 64KiB, TLB friendly
-#define OUT_BUF_SIZE (1024 * 1024)       // 1 MiB output buffer -> amortizes syscall cost
+#define RING_SIZE 64                     // Power of 2 for bitmask indexing
+#define CANDIDATES_PER_BLOCK 8192        // 1024 * 8 wheel steps per block
+#define BLOCK_SIZE 30720ULL              // 1024 * 30 (exact mod-30 multiple keeps wheel aligned)
+#define BLOCK_TEXT_CAP 65520             // 64 KiB minus 16-byte header -> exact 64 KiB struct
+#define OUT_BUF_SIZE (1024 * 1024)       // 1 MiB user-space write buffer
+#define MAX_FILE_SIZE_BYTES (100ULL * 1024 * 1024) // 100 MiB chunk size
 
-// 64 KiB aligned Block: Cache-friendly, no DTLB spills
-// Each block is 64-byte aligned to avoid false sharing. seq is the lock-free state machine:
-// seq == ticket        : block is free for worker to write
-// seq == -ticket-1     : block is ready for writer to consume
-// seq == ticket+RING   : block returned to free pool
+// 64 KiB cache-aligned Block:
+// seq == ticket             : slot is free for worker with `ticket` to populate
+// seq == -ticket - 1        : slot is populated and ready for writer to consume
+// seq == ticket + RING_SIZE : slot has been flushed by writer and recycled
 typedef __declspec(align(64)) struct {
-    volatile LONG64 seq;                // Sequence counter for WaitOnAddress/WakeByAddress
-    uint32_t        text_len;           // Valid bytes in text[]
+    volatile LONG64 seq;
+    uint32_t        text_len;
     uint32_t        pad;
     char            text[BLOCK_TEXT_CAP];
 } Block;
 
 static Block g_blocks[RING_SIZE];
-static volatile LONG64 g_next_ticket = 0; // Atomic ticket dispenser - each block gets unique index
-static volatile LONG   g_stop = 0;
-static uint64_t        g_base_candidate = 7;
-static int             g_base_wheel_idx = 0;
 
-// --- Math & Primality (Montgomery + Magic-Number Trial Division) ---
+// Isolate hot atomic state and read-only globals on distinct 64-byte cache lines
+// to eliminate L1D coherence invalidations (false sharing) across cores.
+static __declspec(align(64)) volatile LONG64 g_next_ticket = 0;
+static __declspec(align(64)) volatile LONG   g_stop = 0;
+static __declspec(align(64)) uint64_t        g_base_candidate = 7;
+static int                                   g_base_wheel_idx = 1;
 
-/* mulmod64: (a*b) % m using 128-bit intermediate.
- * On MSVC we avoid __uint128_t which would call compiler-rt.
- * If high==0, we save a DIV.
+// --- Math & Primality (Montgomery Multiplication + Deterministic Miller-Rabin) ---
+
+/* mulmod64: Computes (a * b) % m using 128-bit intermediate product.
+ * Used once per prime test to compute R^2 mod n for Montgomery domain entry.
  */
 static inline uint64_t mulmod64(uint64_t a, uint64_t b, uint64_t m) {
 #if defined(_MSC_VER)
@@ -107,17 +111,16 @@ static inline uint64_t mulmod64(uint64_t a, uint64_t b, uint64_t m) {
 #endif
 }
 
-/* mont_mul: Montgomery multiplication: a*b*R^-1 mod n, R=2^64
- * This is the HOT PATH. Avoids division entirely, uses only MULH.
- * Requires precomputed inv = -n^-1 mod R.
- * Zen4 MULX throughput is 2/cycle, so this is ~4 cycles.
+/* mont_mul: Montgomery REDC multiplication: (a * b * R^-1) mod n, with R = 2^64.
+ * Replaces 64-bit hardware division with two 64x64->128 multiplications.
+ * Requires precomputed inv = -n^-1 mod 2^64.
  */
 static inline uint64_t mont_mul(uint64_t a, uint64_t b, uint64_t n, uint64_t inv) {
 #if defined(_MSC_VER)
     uint64_t t_hi, t_lo, h;
     t_lo = my_umul128(a, b, &t_hi);
-    uint64_t m = t_lo * inv;            // Low part * inv -> reduction factor
-    h = my_umulh(m, n);                 // High of m*n
+    uint64_t m = t_lo * inv;
+    h = my_umulh(m, n);
 #else
     __uint128_t t = (__uint128_t)a * b;
     uint64_t t_hi = (uint64_t)(t >> 64);
@@ -125,13 +128,13 @@ static inline uint64_t mont_mul(uint64_t a, uint64_t b, uint64_t n, uint64_t inv
     uint64_t h = (uint64_t)(((__uint128_t)m * n) >> 64);
 #endif
     uint64_t res = t_hi - h;
-    return (t_hi < h) ? (res + n) : res; // Conditional add, no branch predictor miss
+    return (t_hi < h) ? (res + n) : res; // Branchless CMOV on x86-64
 }
 
-/* mont_pow: Binary exponentiation in Montgomery domain */
+/* mont_pow: Binary modular exponentiation in Montgomery domain */
 static inline uint64_t mont_pow(uint64_t base, uint64_t exp, uint64_t n,
-    uint64_t inv, uint64_t mont_one) {
-    uint64_t result = mont_one; // 1 in Montgomery form = R mod n
+                                uint64_t inv, uint64_t mont_one) {
+    uint64_t result = mont_one;
     while (exp) {
         if (exp & 1) result = mont_mul(result, base, n, inv);
         base = mont_mul(base, base, n, inv);
@@ -140,12 +143,12 @@ static inline uint64_t mont_pow(uint64_t base, uint64_t exp, uint64_t n,
     return result;
 }
 
-/* is_prime: Deterministic Miller-Rabin for <2^64
- * Steps:
- * 1. LUT for n<=163 (fast path)
- * 2. Trial division by primes 23..163 (divisibility by 2,3,5,7,11,13,17,19 already excluded by wheel)
- * 3. Miller-Rabin base 2 quick reject
- * 4. Miller-Rabin bases {325, 9375, 28178, 450775, 9780504, 1795265022} - known deterministic set for 64-bit (Jim Sinclair)
+/* is_prime: Deterministic Miller-Rabin primality test for all 64-bit integers.
+ * 1. Small prime lookup for n <= 163
+ * 2. Fast trial division by primes 7..163 (2, 3, 5 already excluded by mod-30 wheel)
+ * 3. Montgomery base-2 strong pseudoprime quick reject
+ * 4. Jim Sinclair's 6 remaining bases {325, 9375, 28178, 450775, 9780504, 1795265022},
+ *    proven deterministic for all n < 2^64.
  */
 static int is_prime(uint64_t n) {
     if (n < 2) return 0;
@@ -162,8 +165,9 @@ static int is_prime(uint64_t n) {
         return 0;
     }
 
-    // Fast trial division - eliminates ~90% of composites before expensive MR
-    if (n % 23 == 0 || n % 29 == 0 || n % 31 == 0 || n % 37 == 0 ||
+    // Trial division for primes 7..163 (compiler lowers constant modulo to magic-number MUL)
+    if (n %  7 == 0 || n % 11 == 0 || n % 13 == 0 || n % 17 == 0 || n % 19 == 0 ||
+        n % 23 == 0 || n % 29 == 0 || n % 31 == 0 || n % 37 == 0 ||
         n % 41 == 0 || n % 43 == 0 || n % 47 == 0 || n % 53 == 0 ||
         n % 59 == 0 || n % 61 == 0 || n % 67 == 0 || n % 71 == 0 ||
         n % 73 == 0 || n % 79 == 0 || n % 83 == 0 || n % 89 == 0 ||
@@ -176,22 +180,22 @@ static int is_prime(uint64_t n) {
 
     uint64_t d = n - 1;
     int r = 0;
-    while ((d & 1) == 0) { d >>= 1; ++r; } // Factor n-1 = d*2^r
+    while ((d & 1) == 0) { d >>= 1; ++r; }
 
-    // Compute modular inverse inv = -n^-1 mod 2^64 via Newton-Raphson (4 iterations = 64 bits)
+    // Compute modular inverse inv = -n^-1 mod 2^64 via quadratic Newton-Raphson
     uint64_t inv = (3 * n) ^ 2;
     inv *= 2 - n * inv;
     inv *= 2 - n * inv;
     inv *= 2 - n * inv;
     inv *= 2 - n * inv;
 
-    uint64_t mont_one = (0ULL - n) % n; // R mod n
-    uint64_t mont_minus_one = n - mont_one; // -1 in Montgomery form
+    uint64_t mont_one = (0ULL - n) % n;       // R mod n (1 in Montgomery form)
+    uint64_t mont_minus_one = n - mont_one;   // n - 1 in Montgomery form
     uint64_t mont_two = (mont_one >= mont_minus_one)
         ? (mont_one - mont_minus_one)
-        : (mont_one + mont_one); // 2*R mod n
+        : (mont_one + mont_one);              // 2 in Montgomery form
 
-    // Base 2 test - most composites fail here
+    // Base-2 test eliminates >99.9% of surviving composites
     uint64_t x = mont_pow(mont_two, d, n, inv, mont_one);
     if (x != mont_one && x != mont_minus_one) {
         int composite = 1;
@@ -202,19 +206,23 @@ static int is_prime(uint64_t n) {
         if (composite) return 0;
     }
 
-    // Prepare R^2 mod n for converting bases into Montgomery form
+    // Convert remaining 6 Sinclair bases into Montgomery domain via R^2 mod n
     uint64_t r2 = mulmod64(mont_one, mont_one, n);
     static const uint64_t bases[6] = {
         325, 9375, 28178, 450775, 9780504, 1795265022
     };
 
     for (int i = 0; i < 6; ++i) {
-        uint64_t a = bases[i] % n;
+        // Avoid hardware DIV instruction whenever n > bases[i]
+        uint64_t a = (bases[i] < n) ? bases[i] : (bases[i] % n);
         if (a == 0) continue;
 
-        uint64_t mont_a = mont_mul(a, r2, n, inv); // a*R mod n
+        uint64_t mont_a = mont_mul(a, r2, n, inv);
         x = mont_pow(mont_a, d, n, inv, mont_one);
-        if (x == mont_one || x == mont_minus_one) continue;
+        if (x == mont_one || x != mont_minus_one && r == 1) {
+            if (x == mont_one) continue;
+        }
+        if (x == mont_minus_one) continue;
 
         int composite = 1;
         for (int j = 0; j < r - 1; ++j) {
@@ -226,15 +234,15 @@ static int is_prime(uint64_t n) {
     return 1;
 }
 
-// --- Mod-30 Wheel ---
-// Numbers coprime to 30 are 1,7,11,13,17,19,23,29 -> 8 residues per 30 numbers
-// This skips 73.3% of numbers (all multiples of 2,3,5)
-static const uint8_t wheel_rem[8] = { 1, 7, 11, 13, 17, 19, 23, 29 };
-static const uint8_t wheel_step[8] = { 6, 4,  2,  4,  2,  4,  6,  2 }; // Gaps to next residue
+// --- Mod-30 Wheel Factorization ---
+// Coprime residues mod 30: {1, 7, 11, 13, 17, 19, 23, 29} (8 candidates per 30 integers).
+// Skips 73.3% of integers (all multiples of 2, 3, and 5) in O(1) register steps.
+static const uint8_t wheel_rem[8]  = { 1, 7, 11, 13, 17, 19, 23, 29 };
+static const uint8_t wheel_step[8] = { 6, 4,  2,  4,  2,  4,  6,  2 };
 
 static inline uint64_t align_to_wheel30(uint64_t n, int* wheel_idx) {
     uint64_t base = (n / 30) * 30;
-    uint64_t rem = n % 30;
+    uint64_t rem  = n % 30;
     for (int i = 0; i < 8; ++i) {
         if (wheel_rem[i] >= rem) {
             *wheel_idx = i;
@@ -247,18 +255,17 @@ static inline uint64_t align_to_wheel30(uint64_t n, int* wheel_idx) {
 
 static inline uint64_t next_candidate(uint64_t n, int* wheel_idx) {
     uint64_t r = n + wheel_step[*wheel_idx];
-    *wheel_idx = (*wheel_idx + 1) & 7; // Fast mod 8
+    *wheel_idx = (*wheel_idx + 1) & 7;
     return r;
 }
 
-// --- Fast 2-Digits-at-a-Time Integer to String ---
-// LUT for 00-99, processes 2 digits per iteration -> 2x faster than div-by-10 loop
+// --- Fast 2-Digit Lookup Table Integer-to-ASCII ---
 static const char g_digits_lut[200] =
-"0001020304050607080910111213141516171819"
-"2021222324252627282930313233343536373839"
-"4041424344454647484950515253545556575859"
-"6061626364656667686970717273747576777879"
-"8081828384858687888990919293949596979899";
+    "0001020304050607080910111213141516171819"
+    "2021222324252627282930313233343536373839"
+    "4041424344454647484950515253545556575859"
+    "6061626364656667686970717273747576777879"
+    "8081828384858687888990919293949596979899";
 
 static inline size_t fast_utoa_nl(uint64_t val, char* out) {
     char temp[20];
@@ -271,14 +278,13 @@ static inline size_t fast_utoa_nl(uint64_t val, char* out) {
     }
     if (val < 10) {
         temp[len++] = (char)('0' + val);
-    }
-    else {
+    } else {
         uint64_t idx = val * 2;
         temp[len++] = g_digits_lut[idx + 1];
         temp[len++] = g_digits_lut[idx];
     }
 
-    size_t out_len = len;
+    size_t out_len = (size_t)len;
     while (len > 0) {
         *out++ = temp[--len];
     }
@@ -286,10 +292,8 @@ static inline size_t fast_utoa_nl(uint64_t val, char* out) {
     return out_len + 1;
 }
 
-// --- Writer Thread ---
-#define MAX_FILE_SIZE_BYTES (100LL * 1024 * 1024) // 100 MB per file - balances filesystem & resume granularity
-
-static FILE* g_file = NULL;
+// --- Sequential I/O Writer Thread ---
+static FILE*    g_file = NULL;
 static char     g_out_buf[OUT_BUF_SIZE];
 static size_t   g_out_used = 0;
 static uint64_t g_current_file_bytes = 0;
@@ -299,7 +303,7 @@ static int      g_file_index = 1;
 static char     g_current_path[MAX_PATH];
 
 static void flush_output(void) {
-    if (g_out_used > 0) {
+    if (g_out_used > 0 && g_file) {
         fwrite(g_out_buf, 1, g_out_used, g_file);
         g_out_used = 0;
     }
@@ -314,14 +318,14 @@ static void close_file(void) {
     }
 }
 
-/* writer_proc: Single writer, pinned to core 14 (last core of 7840HS)
- * Waits in order (expected ticket) - ensures prime file is sorted despite out-of-order workers
- * Uses WaitOnAddress (futex-like) - zero CPU while waiting
+/* writer_proc: Single consumer pinned to Logical Processor 14 (Core 7, Thread 0).
+ * Drains ring slots strictly in ticket order (`expected++`) so output files are
+ * guaranteed sorted despite out-of-order worker completion.
  */
 static DWORD WINAPI writer_proc(LPVOID param) {
     (void)param;
     SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << 14);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
     LONG64 expected = 0;
     for (;;) {
@@ -342,8 +346,9 @@ static DWORD WINAPI writer_proc(LPVOID param) {
             }
         }
 
-        // Zero-copy streaming: memcpy from block to 1MB buffer, then chunk
-        if (g_out_used + b->text_len > sizeof(g_out_buf)) flush_output();
+        if (g_out_used + b->text_len > sizeof(g_out_buf)) {
+            flush_output();
+        }
         memcpy(g_out_buf + g_out_used, b->text, b->text_len);
 
         g_out_used += b->text_len;
@@ -358,7 +363,7 @@ static DWORD WINAPI writer_proc(LPVOID param) {
 
             g_file = fopen(g_current_path, "wb");
             if (!g_file) {
-                printf("Failed to open new file: %s\n", g_current_path);
+                fprintf(stderr, "Failed to open new chunk file: %s\n", g_current_path);
                 InterlockedExchange(&g_stop, 1);
                 break;
             }
@@ -370,39 +375,46 @@ static DWORD WINAPI writer_proc(LPVOID param) {
         WakeByAddressAll((PVOID)&b->seq);
         expected++;
     }
+
 done:
     close_file();
+    // Wake any workers waiting on ring slots during shutdown
+    for (int i = 0; i < RING_SIZE; ++i) {
+        WakeByAddressAll((PVOID)&g_blocks[i].seq);
+    }
     return 0;
 }
 
 // --- Worker Threads ---
-/* worker_proc: 14 workers pinned to cores 0-13
- * Each worker:
- * 1. Atomically grabs next ticket
- * 2. Waits for its ring slot to be free (seq == ticket)
- * 3. Computes candidate range: base + ticket*BLOCK_SIZE (block size is multiple of 30, so wheel stays aligned!)
- * 4. Tests CANDIDATES_PER_BLOCK numbers via wheel
- * 5. Formats primes directly into block.text (no malloc, no shared state)
- * 6. Marks block ready: seq = -ticket-1, wakes writer
- */
+/* worker_proc: 14 workers pinned to Logical Processors 0..13 (Physical Cores 0..6). */
 static DWORD WINAPI worker_proc(LPVOID param) {
     int worker_id = (int)(intptr_t)param;
     SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << worker_id);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
 
     for (;;) {
         if (ReadAcquire(&g_stop)) break;
 
         LONG64 ticket = InterlockedIncrement64(&g_next_ticket) - 1;
+        uint64_t offset = (uint64_t)ticket * BLOCK_SIZE;
+
+        // Guard against 64-bit unsigned integer wrap-around near UINT64_MAX
+        if (UINT64_MAX - g_base_candidate <= offset + BLOCK_SIZE) {
+            InterlockedExchange(&g_stop, 1);
+            break;
+        }
+
         Block* b = &g_blocks[ticket & (RING_SIZE - 1)];
         LONG64 current_seq;
 
         while ((current_seq = ReadAcquire64(&b->seq)) != ticket) {
-            WaitOnAddress((PVOID)&b->seq, &current_seq, sizeof(LONG64), INFINITE);
+            if (ReadAcquire(&g_stop)) return 0;
+            WaitOnAddress((PVOID)&b->seq, &current_seq, sizeof(LONG64), 50);
         }
 
-        // Wheel index is constant across all blocks! Because BLOCK_SIZE % 30 == 0
-        uint64_t c = g_base_candidate + (uint64_t)ticket * BLOCK_SIZE;
+        // Because BLOCK_SIZE (30720) is an exact multiple of 30, every block starts
+        // at the exact same mod-30 wheel index as g_base_candidate.
+        uint64_t c = g_base_candidate + offset;
         int wheel_idx = g_base_wheel_idx;
 
         size_t pos = 0;
@@ -420,7 +432,7 @@ static DWORD WINAPI worker_proc(LPVOID param) {
     return 0;
 }
 
-// --- Ctrl+C Handler & File Resume ---
+// --- Graceful Shutdown & Auto-Resume ---
 static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT) {
         InterlockedExchange(&g_stop, 1);
@@ -429,20 +441,23 @@ static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     return FALSE;
 }
 
-/* read_last_prime: Resume support - reads last 256 bytes of latest file to find last complete prime */
+/* read_last_prime: Reads the tail 256 bytes of the latest file to find the last committed prime */
 static uint64_t read_last_prime(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
 
     _fseeki64(f, 0, SEEK_END);
     __int64 size = _ftelli64(f);
-    if (size == 0) { fclose(f); return 0; }
+    if (size <= 0) {
+        fclose(f);
+        return 0;
+    }
 
     __int64 read_size = size < 256 ? size : 256;
     _fseeki64(f, -read_size, SEEK_END);
 
     char buf[257];
-    size_t bytes_read = fread(buf, 1, read_size, f);
+    size_t bytes_read = fread(buf, 1, (size_t)read_size, f);
     fclose(f);
 
     buf[bytes_read] = '\0';
@@ -459,14 +474,14 @@ int main(void) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
-    // 1. Get exe directory for output files
+    // 1. Resolve executable directory for output chunk files
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
     char* slash = strrchr(path, '\\');
     if (slash) *(slash + 1) = '\0';
     strcpy(g_dir_path, path);
 
-    // 2. Find latest primegenerated*.txt to resume
+    // 2. Scan for existing primegenerated*.txt files to support seamless resume
     char search_path[MAX_PATH];
     snprintf(search_path, MAX_PATH, "%sprimegenerated*.txt", g_dir_path);
 
@@ -491,17 +506,19 @@ int main(void) {
         }
     }
 
-    // 3. Setup base candidate after resume
+    // 3. Initialize wheel state for either resume or fresh start
     if (last_prime >= 5) {
-        printf("Resuming after prime %llu in file %s\n", last_prime, g_current_path);
+        printf("Resuming after prime %llu in file %s\n",
+               (unsigned long long)last_prime, g_current_path);
         g_file = fopen(g_current_path, "ab");
-        _fseeki64(g_file, 0, SEEK_END);
-        g_current_file_bytes = (uint64_t)_ftelli64(g_file);
-        g_base_candidate = (last_prime < 7) ? 7 : align_to_wheel30(last_prime + 2, &g_base_wheel_idx);
-    }
-    else {
-        g_base_candidate = 7;
-        g_base_wheel_idx = 1;
+        if (g_file) {
+            _fseeki64(g_file, 0, SEEK_END);
+            g_current_file_bytes = (uint64_t)_ftelli64(g_file);
+        }
+        uint64_t start_n = (last_prime < 7) ? 7ULL : (last_prime + 2ULL);
+        g_base_candidate = align_to_wheel30(start_n, &g_base_wheel_idx);
+    } else {
+        g_base_candidate = align_to_wheel30(7ULL, &g_base_wheel_idx);
         g_file_index = 1;
         snprintf(g_current_path, MAX_PATH, "%sprimegenerated%d.txt", g_dir_path, g_file_index);
         g_file = fopen(g_current_path, "wb");
@@ -512,19 +529,25 @@ int main(void) {
         }
     }
 
-    if (!g_file) { printf("Error opening file.\n"); return 1; }
+    if (!g_file) {
+        fprintf(stderr, "Error opening output file: %s\n", g_current_path);
+        return 1;
+    }
 
     setvbuf(g_file, NULL, _IONBF, 0);
 
-    for (int i = 0; i < RING_SIZE; ++i) g_blocks[i].seq = i;
+    for (int i = 0; i < RING_SIZE; ++i) {
+        g_blocks[i].seq = i;
+    }
 
     HANDLE workers[NUM_WORKERS];
-    for (int i = 0; i < NUM_WORKERS; ++i)
+    for (int i = 0; i < NUM_WORKERS; ++i) {
         workers[i] = CreateThread(NULL, 0, worker_proc, (LPVOID)(intptr_t)i, 0, NULL);
+    }
 
     HANDLE writer = CreateThread(NULL, 0, writer_proc, NULL, 0, NULL);
 
-    printf("Generating primes using 14 threads. Press Ctrl+C to stop safely...\n");
+    printf("Generating primes across 14 worker threads. Press Ctrl+C to flush and stop...\n");
 
     WaitForMultipleObjects(NUM_WORKERS, workers, TRUE, INFINITE);
     WaitForSingleObject(writer, INFINITE);
@@ -532,6 +555,6 @@ int main(void) {
     for (int i = 0; i < NUM_WORKERS; ++i) CloseHandle(workers[i]);
     CloseHandle(writer);
 
-    printf("Safely stopped.\n");
+    printf("Flushed and stopped safely.\n");
     return 0;
 }
