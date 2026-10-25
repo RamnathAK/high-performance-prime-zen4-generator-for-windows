@@ -122,9 +122,9 @@ clang-cl /O2 /arch:AVX2 hp_prime_stream_win.c /Fe:hp-primes.exe -fuse-ld=link /l
 .\hp-primes.exe
 ```
 
-### 2. One-Click Build Script (`scripts/build.ps1`)
+### 2. One-Click Build Script 
 
-Alternatively, save the following snippet as `scripts/build.ps1` to automate environment initialization and compilation:
+Alternatively, save the following snippet below as .ps to automate environment initialization and compilation:
 
 ```powershell
 # scripts/build.ps1
