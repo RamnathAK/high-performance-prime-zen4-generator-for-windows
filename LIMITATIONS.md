@@ -1,6 +1,6 @@
 # Limitations — `hp_prime_stream_win.c`  
 
-Scope: `hp_prime_stream_win.c` (14-worker / 1-writer lock-free ring buffer, 64 KiB blocks, mod-30 wheel, Montgomery + deterministic Miller–Rabin). `Primes.c` is not covered here.  
+Scope: `hp_prime_stream_win.c` (14-worker / 1-writer lock-free ring buffer, 64 KiB blocks, mod-30 wheel, Montgomery + deterministic Miller–Rabin). 
 
 ## 64-bit ceiling  
 - Max n = 2^64−1. Deterministic Miller–Rabin bases `{2, **325**, **9375**, **28178**, **450775**, **9780504**, **1795265022**}` are proven deterministic only for n < 2^64. Beyond that requires wider arithmetic, additional bases, or **BPSW**.  
