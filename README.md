@@ -98,3 +98,9 @@ ARCHITECTURE.md / BUILD.md / BENCHMARKS.md
 ## License
 
 MIT
+
+## Author
+
+RamnathAK — Bangalore — built for 7840HS, but portable to any Zen 4.
+
+PRs welcome! See [CONTRIBUTING.md](CONTRIBUTING.md)
