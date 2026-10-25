@@ -158,11 +158,12 @@ Write-Host "Build complete! Run .\hp-primes.exe to start generating primes." -Fo
 ## 📁 Repository Layout
 
 ```text
-├── hp_prime_stream_win.c    # Single-file lock-free prime stream generator
-├── scripts/
-│   └── build.ps1            # PowerShell environment bootstrap & clang-cl build script
-├── README.md                # Architecture, benchmarks, and build documentation
-└── LICENSE                  # MIT License
+├── src/
+│   └── hp_prime_stream_win.c   # Lock-free Zen 4 optimized prime generator
+├── CONTRIBUTING.md            # Contributor guide and coding 
+├── LICENSE                    # MIT License
+├── LIMITATIONS.md             # Algorithmic limitations and implementation notes
+└── README.md                  # Project overview, architecture, benchmarks, and build guide
 ```
 
 ## 📄 License
