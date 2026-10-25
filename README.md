@@ -8,6 +8,8 @@ A multi-threaded, lock-free prime number generator engineered to maximize throug
 [![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-blue)]()
 [![Zen 4 Optimized](https://img.shields.io/badge/Zen%204-Optimized-red)]()
 
+![Architecture](assets/architecture.png)
+
 ## 🚀 Technical Highlights
 
 Built to explore low-level systems programming, concurrency, and hardware-specific optimizations in pure C.
